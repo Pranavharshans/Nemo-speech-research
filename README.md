@@ -75,3 +75,4 @@ We welcome community contributions! Please refer to
 ## Licenses
 
 NeMo is licensed under the [Apache License 2.0](https://github.com/NVIDIA/NeMo?tab=Apache-2.0-1-ov-file).
+# Nemo-speech-research
