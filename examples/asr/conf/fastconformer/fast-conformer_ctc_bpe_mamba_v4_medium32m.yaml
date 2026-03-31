@@ -1,0 +1,28 @@
+# Experimental V4 config for the Medium (32M) FastConformer-CTC model with
+# an early-stage Mamba span.
+#
+# Layout (1-based encoder layers):
+# - Mamba: 1 through 4
+# - FastConformer: 5 through 16
+
+name: "FastConformer-CTC-BPE-Mamba-V4-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.MambaConformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    # Converted from the requested 1-based layer layout:
+    # Mamba on 1-4 and FastConformer on 5-16.
+    mamba_layer_indices: [0, 1, 2, 3]
+    mamba_expand: 2
+    mamba_local_conv_kernel_size: 9
+
+  optim:
+    weight_decay: 1e-3
