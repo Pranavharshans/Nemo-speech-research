@@ -1,0 +1,22 @@
+# Experimental V1 config for FastConformer + Hybrid TDT/CTC with middle encoder layers replaced by Mamba blocks.
+#
+# Run with the existing hybrid RNNT/CTC BPE training entrypoint:
+# python examples/asr/asr_hybrid_transducer_ctc/speech_to_text_hybrid_rnnt_ctc_bpe.py \
+#   --config-path="../conf/fastconformer/hybrid_transducer_ctc" \
+#   --config-name="fastconformer_hybrid_tdt_ctc_bpe_mamba_v1" \
+#   model.train_ds.manifest_filepath=... \
+#   model.validation_ds.manifest_filepath=... \
+#   model.tokenizer.dir=... \
+#   model.tokenizer.type=bpe
+
+name: "FastConformer-Hybrid-TDT-CTC-BPE-Mamba-V1"
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.MambaConformerEncoder
+    mamba_layer_indices: [6, 7, 8, 9]
+    mamba_expand: 2
+    mamba_local_conv_kernel_size: 9

@@ -1,0 +1,26 @@
+# Experimental V1 config for the Medium (32M) FastConformer-CTC model with
+# middle encoder layers replaced by Mamba blocks.
+#
+# This keeps the successful medium CTC recipe directly comparable to the stock
+# FastConformer baseline and only changes the encoder target plus the medium
+# encoder dimensions documented in fast-conformer_ctc_bpe.yaml.
+
+name: "FastConformer-CTC-BPE-Mamba-V1-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.MambaConformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    mamba_layer_indices: [6, 7, 8, 9]
+    mamba_expand: 2
+    mamba_local_conv_kernel_size: 9
+
+  optim:
+    weight_decay: 1e-3
