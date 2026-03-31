@@ -1,0 +1,24 @@
+# Experimental V7 config for the Medium (32M) FastConformer-CTC model with
+# TempConv on layer 6 and GatedFC on layer 7 (0-based indexing).
+
+name: "FastConformer-CTC-BPE-V7-TempConv-GatedFC-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.TempConvGatedFCConformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    temp_conv_layer_indices: [6]
+    temp_conv_expansion_factor: 2
+    temp_conv_kernel_size: 15
+    gated_fc_layer_indices: [7]
+    gated_fc_expansion_factor: 4
+
+  optim:
+    weight_decay: 1e-3
