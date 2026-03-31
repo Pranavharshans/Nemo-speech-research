@@ -1,0 +1,21 @@
+# Experimental V6 config for the Medium (32M) FastConformer-CTC model with
+# GatedFC blocks on encoder layers 6 and 7 (1-based indexing).
+
+name: "FastConformer-CTC-BPE-GatedFC-V6-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.GatedFCConformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    gated_fc_layer_indices: [5, 6]
+    gated_fc_expansion_factor: 4
+
+  optim:
+    weight_decay: 1e-3

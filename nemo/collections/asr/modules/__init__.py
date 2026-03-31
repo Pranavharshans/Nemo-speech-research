@@ -31,6 +31,7 @@ from nemo.collections.asr.modules.conv_asr import (  # noqa: F401
     ParallelConvASREncoder,
     SpeakerDecoder,
 )
+from nemo.collections.asr.modules.gated_fc_conformer_encoder import GatedFCConformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.hybrid_autoregressive_transducer import HATJoint  # noqa: F401
 from nemo.collections.asr.modules.lstm_decoder import LSTMDecoder  # noqa: F401
 from nemo.collections.asr.modules.mamba_conformer_encoder import MambaConformerEncoder  # noqa: F401
