@@ -1,0 +1,50 @@
+# Experimental 32M FastConformer + Hybrid TDT/CTC model.
+# This ports the stock FastConformer hybrid TDT+CTC recipe onto the
+# medium 32M FastConformer encoder dimensions used in the CTC baseline.
+
+name: "FC-Hybrid-TDT-CTC-32m"
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+
+model:
+  preprocessor:
+    features: 80
+    log: true
+    pad_value: 0.0
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 256
+    joint_hidden: 256
+
+  train_ds:
+    max_duration: 20
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 16
+    d_model: 256
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 4
+    xscaling: true
+    conv_kernel_size: 9
+
+  decoder:
+    prednet:
+      pred_hidden: ${model.model_defaults.pred_hidden}
+      pred_rnn_layers: 1
+      dropout: 0.1
+
+  joint:
+    fuse_loss_wer: false
+    jointnet:
+      joint_hidden: ${model.model_defaults.joint_hidden}
+      activation: "relu"
+      dropout: 0.1
+
+  aux_ctc:
+    ctc_loss_weight: 0.3
