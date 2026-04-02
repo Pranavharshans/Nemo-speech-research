@@ -1,0 +1,46 @@
+# Experimental Zipformer-inspired CTC ASR model around the medium 32M budget.
+# It keeps the standard 32M FastConformer width/depth, but applies a U-shaped
+# multi-rate encoder schedule with a lower-frame-rate middle stage.
+
+name: "Zipformer-CTC-32m"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.ZipformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 16
+    d_model: 256
+
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: false
+
+    ff_expansion_factor: 4
+    self_attention_model: rel_pos
+    n_heads: 4
+    att_context_size: [-1, -1]
+    att_context_style: regular
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 5000
+    use_pytorch_sdpa: false
+    use_pytorch_sdpa_backends: []
+
+    conv_kernel_size: 9
+    conv_norm_type: batch_norm
+    conv_context_size: null
+
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+
+    zipformer_stage_layers: [4, 8, 4]
+    zipformer_downsample_factor: 2
+    zipformer_downsample_kernel_size: 3
+    zipformer_downsample_expansion_factor: 2

@@ -52,3 +52,4 @@ from nemo.collections.asr.modules.ssl_modules import (  # noqa: F401
     RandomProjectionVectorQuantizer,
 )
 from nemo.collections.asr.modules.tempcov_gatedfc_conformer_encoder import TempConvGatedFCConformerEncoder  # noqa: F401
+from nemo.collections.asr.modules.zipformer_encoder import ZipformerEncoder  # noqa: F401
