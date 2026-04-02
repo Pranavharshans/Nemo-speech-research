@@ -1,0 +1,12 @@
+# Experimental 32M GatedFC-FastConformer + Hybrid TDT/CTC model (V2).
+# This keeps the small hybrid decoder/joint dimensions and swaps encoder
+# layers 6, 7, 8 and 9 to GatedFC blocks.
+
+name: "GatedFC-Hybrid-TDT-CTC-32m-V2"
+
+defaults:
+  - gatedfc_hybrid_tdt_ctc_32m
+
+model:
+  encoder:
+    gated_fc_layer_indices: [5, 6, 7, 8]
