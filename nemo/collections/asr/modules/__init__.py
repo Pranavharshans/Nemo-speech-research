@@ -20,6 +20,7 @@ from nemo.collections.asr.modules.audio_preprocessing import (  # noqa: F401
     SpectrogramAugmentation,
 )
 from nemo.collections.asr.modules.beam_search_decoder import BeamSearchDecoderWithLM  # noqa: F401
+from nemo.collections.asr.modules.branchformer_encoder import BranchformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder, ConformerEncoderAdapter  # noqa: F401
 from nemo.collections.asr.modules.conv_asr import (  # noqa: F401
     ConvASRDecoder,
