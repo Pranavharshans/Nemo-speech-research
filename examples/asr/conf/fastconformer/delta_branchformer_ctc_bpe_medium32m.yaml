@@ -1,0 +1,29 @@
+# Delta-Branchformer medium ASR encoder built on top of the repo's
+# FastConformer-CTC training recipe for direct comparison with the other 32M
+# encoder variants.
+
+name: "Delta-Branchformer-CTC-BPE-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.DeltaBranchformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+    delta_use_second_order: true
+    delta_alpha_init: 1.0
+
+  optim:
+    weight_decay: 1e-3
