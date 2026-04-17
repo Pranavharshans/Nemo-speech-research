@@ -1,0 +1,29 @@
+# E-Branchformer-style medium ASR encoder in the same training envelope as the
+# repository's FastConformer-CTC medium32m runs.
+#
+# The base training recipe remains the standard FastConformer-CTC config. Only
+# the encoder block type and medium-size dimensions are changed here.
+
+name: "E-Branchformer-CTC-BPE-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.BranchformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    conv_kernel_size: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+
+  optim:
+    weight_decay: 1e-3
