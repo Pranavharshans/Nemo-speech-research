@@ -34,6 +34,8 @@ __all__ = [
     'ConvolutionalGatingMLP',
     'MultiScaleConvolutionalGatingMLP',
     'MultiScaleBranchformerLayer',
+    'TemporalDownsampleBlock',
+    'TemporalUpsampleFusionBlock',
     'DeltaBranchformerLayer',
     'TemporalDeltaBranch',
 ]
@@ -637,3 +639,67 @@ class MultiScaleBranchformerLayer(BranchformerLayer):
             gate_activation=gate_activation,
             use_bias=use_bias,
         )
+
+
+class TemporalDownsampleBlock(nn.Module):
+    """
+    Depthwise strided temporal downsample block for U-Net Branchformer.
+    """
+
+    def __init__(self, d_model: int, kernel_size: int = 3, stride: int = 2):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be odd, got {kernel_size}")
+        self.stride = stride
+        self.depthwise = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=kernel_size // 2,
+            groups=d_model,
+            bias=False,
+        )
+        self.norm = LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.depthwise(x.transpose(1, 2)).transpose(1, 2)
+        x = self.norm(x)
+        lengths = torch.div(lengths + self.stride - 1, self.stride, rounding_mode="floor")
+        return x, lengths
+
+
+class TemporalUpsampleFusionBlock(nn.Module):
+    """
+    Repeat-interleave upsample with depthwise smoothing and scalar skip fusion.
+    """
+
+    def __init__(self, d_model: int, kernel_size: int = 3):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be odd, got {kernel_size}")
+        self.smooth = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2,
+            groups=d_model,
+            bias=False,
+        )
+        self.alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.norm = LayerNorm(d_model)
+
+    def forward(self, skip: torch.Tensor, low_res: torch.Tensor) -> torch.Tensor:
+        target_len = skip.size(1)
+        upsampled = low_res.repeat_interleave(2, dim=1)
+        if upsampled.size(1) > target_len:
+            upsampled = upsampled[:, :target_len, :]
+        elif upsampled.size(1) < target_len:
+            pad_len = target_len - upsampled.size(1)
+            upsampled = torch.cat([upsampled, upsampled.new_zeros(upsampled.size(0), pad_len, upsampled.size(2))], dim=1)
+
+        upsampled = self.smooth(upsampled.transpose(1, 2)).transpose(1, 2)
+        blend = torch.sigmoid(self.alpha)
+        fused = blend * upsampled + (1.0 - blend) * skip
+        return self.norm(fused)
