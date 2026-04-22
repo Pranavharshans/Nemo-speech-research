@@ -1,0 +1,17 @@
+# Experimental 32M MultiScale-Branchformer + Hybrid TDT/CTC model.
+#
+# Variant 2 adds only the multi-scale cgMLP local branch over the baseline
+# Branchformer hybrid configuration. All decoder, joint and loss settings are
+# inherited unchanged for a clean encoder-side ablation.
+
+name: "MultiScale-Branchformer-Hybrid-TDT-CTC-32m"
+
+defaults:
+  - branchformer_hybrid_tdt_ctc_32m
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.MultiScaleBranchformerEncoder
+    cgmlp_conv_kernel: 31
+    cgmlp_scale_kernels: [9, 31, 63]
+
