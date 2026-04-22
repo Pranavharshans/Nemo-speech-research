@@ -1,0 +1,40 @@
+# Experimental 32M Branchformer + Hybrid TDT/CTC model.
+#
+# This is the baseline Branchformer hybrid transducer recipe:
+# - 16-layer Branchformer encoder
+# - 80-bin frontend
+# - TDT + auxiliary CTC hybrid loss
+# - stock TDT decoder / joint dimensions (640) from the large recipe
+
+name: "Branchformer-Hybrid-TDT-CTC-32m"
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+
+model:
+  preprocessor:
+    features: 80
+    log: true
+    pad_value: 0.0
+
+  train_ds:
+    max_duration: 20
+
+  encoder:
+    _target_: nemo.collections.asr.modules.BranchformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 16
+    d_model: 256
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 4
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+
