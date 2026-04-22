@@ -29,7 +29,14 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import activation_registry
 
-__all__ = ['BranchformerLayer', 'ConvolutionalGatingMLP', 'DeltaBranchformerLayer', 'TemporalDeltaBranch']
+__all__ = [
+    'BranchformerLayer',
+    'ConvolutionalGatingMLP',
+    'MultiScaleConvolutionalGatingMLP',
+    'MultiScaleBranchformerLayer',
+    'DeltaBranchformerLayer',
+    'TemporalDeltaBranch',
+]
 
 
 class ConvolutionalGatingMLP(nn.Module):
@@ -117,6 +124,98 @@ class ConvolutionalGatingMLP(nn.Module):
         if cache is None:
             return x
         return x, cache
+
+
+class MultiScaleConvolutionalGatingMLP(nn.Module):
+    """
+    cgMLP branch with multiple parallel depthwise convolutions merged through
+    learned softmax-normalized per-scale weights.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        linear_units: int,
+        kernel_sizes: list[int],
+        dropout: float,
+        use_linear_after_conv: bool = False,
+        gate_activation: str = 'identity',
+        use_bias: bool = True,
+    ):
+        super().__init__()
+
+        if linear_units % 2 != 0:
+            raise ValueError(f"linear_units must be even for cgMLP gating, got {linear_units}")
+        if len(kernel_sizes) == 0:
+            raise ValueError("kernel_sizes must not be empty for MultiScaleConvolutionalGatingMLP")
+        if any(kernel_size <= 0 or kernel_size % 2 == 0 for kernel_size in kernel_sizes):
+            raise ValueError(f"All kernel_sizes must be positive odd integers, got {kernel_sizes}")
+
+        self.linear_units = linear_units
+        self.hidden_units = linear_units // 2
+        self.use_linear_after_conv = use_linear_after_conv
+        self.kernel_sizes = list(kernel_sizes)
+
+        self.channel_proj_in = nn.Linear(d_model, linear_units, bias=use_bias)
+        self.channel_proj_out = nn.Linear(self.hidden_units, d_model, bias=use_bias)
+        self.activation = Swish()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = LayerNorm(self.hidden_units)
+        self.depthwise_convs = nn.ModuleList(
+            [
+                nn.Conv1d(
+                    in_channels=self.hidden_units,
+                    out_channels=self.hidden_units,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=kernel_size // 2,
+                    groups=self.hidden_units,
+                    bias=use_bias,
+                )
+                for kernel_size in self.kernel_sizes
+            ]
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(len(self.kernel_sizes), dtype=torch.float32))
+
+        if use_linear_after_conv:
+            self.linear_after_conv = nn.Linear(self.hidden_units, self.hidden_units, bias=use_bias)
+        else:
+            self.linear_after_conv = None
+
+        if gate_activation not in activation_registry:
+            raise ValueError(
+                f"gate_activation='{gate_activation}' is not valid. Supported values: {sorted(activation_registry)}"
+            )
+        self.gate_activation = activation_registry[gate_activation]()
+
+    def forward(self, x, pad_mask=None, cache=None):
+        if cache is not None:
+            raise NotImplementedError("MultiScaleConvolutionalGatingMLP currently supports offline execution only.")
+
+        x = self.channel_proj_in(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        x_residual, x_gate = x.chunk(2, dim=-1)
+        x_gate = self.norm(x_gate)
+
+        if pad_mask is not None:
+            x_gate = x_gate.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+
+        x_gate = x_gate.transpose(1, 2)
+        conv_outputs = [depthwise_conv(x_gate) for depthwise_conv in self.depthwise_convs]
+        scale_weights = torch.softmax(self.scale_logits, dim=0)
+        x_gate = sum(weight * conv_output for weight, conv_output in zip(scale_weights, conv_outputs))
+        x_gate = x_gate.transpose(1, 2)
+
+        if self.linear_after_conv is not None:
+            x_gate = self.linear_after_conv(x_gate)
+        x_gate = self.gate_activation(x_gate)
+
+        x = x_residual * x_gate
+        x = self.channel_proj_out(x)
+        x = self.dropout(x)
+        return x
 
 
 class BranchformerLayer(nn.Module):
@@ -470,3 +569,71 @@ class DeltaBranchformerLayer(BranchformerLayer):
         if cache_last_channel is None:
             return x
         return x, cache_last_channel, cache_last_time
+
+
+class MultiScaleBranchformerLayer(BranchformerLayer):
+    """
+    Branchformer layer with a multi-scale cgMLP local branch.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        cgmlp_linear_units: int,
+        cgmlp_scale_kernels: list[int],
+        self_attention_model: str = 'rel_pos',
+        global_tokens: int = 0,
+        global_tokens_spacing: int = 1,
+        global_attn_separate: bool = False,
+        n_heads: int = 4,
+        merge_conv_kernel: int = 3,
+        dropout: float = 0.1,
+        dropout_att: float = 0.1,
+        pos_bias_u=None,
+        pos_bias_v=None,
+        att_context_size=[-1, -1],
+        conv_context_size=None,
+        use_linear_after_conv: bool = False,
+        gate_activation: str = 'identity',
+        use_ffn: bool = True,
+        macaron_ffn: bool = True,
+        use_bias: bool = True,
+        use_pytorch_sdpa: bool = False,
+        use_pytorch_sdpa_backends=None,
+    ):
+        primary_kernel = cgmlp_scale_kernels[len(cgmlp_scale_kernels) // 2]
+        super().__init__(
+            d_model=d_model,
+            d_ff=d_ff,
+            cgmlp_linear_units=cgmlp_linear_units,
+            cgmlp_conv_kernel=primary_kernel,
+            self_attention_model=self_attention_model,
+            global_tokens=global_tokens,
+            global_tokens_spacing=global_tokens_spacing,
+            global_attn_separate=global_attn_separate,
+            n_heads=n_heads,
+            merge_conv_kernel=merge_conv_kernel,
+            dropout=dropout,
+            dropout_att=dropout_att,
+            pos_bias_u=pos_bias_u,
+            pos_bias_v=pos_bias_v,
+            att_context_size=att_context_size,
+            conv_context_size=conv_context_size,
+            use_linear_after_conv=use_linear_after_conv,
+            gate_activation=gate_activation,
+            use_ffn=use_ffn,
+            macaron_ffn=macaron_ffn,
+            use_bias=use_bias,
+            use_pytorch_sdpa=use_pytorch_sdpa,
+            use_pytorch_sdpa_backends=use_pytorch_sdpa_backends,
+        )
+        self.cgmlp = MultiScaleConvolutionalGatingMLP(
+            d_model=d_model,
+            linear_units=cgmlp_linear_units,
+            kernel_sizes=cgmlp_scale_kernels,
+            dropout=dropout,
+            use_linear_after_conv=use_linear_after_conv,
+            gate_activation=gate_activation,
+            use_bias=use_bias,
+        )
