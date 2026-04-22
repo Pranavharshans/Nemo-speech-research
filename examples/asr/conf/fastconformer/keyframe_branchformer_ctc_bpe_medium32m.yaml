@@ -1,0 +1,33 @@
+# KeyFrame-Branchformer medium CTC model.
+#
+# This is the training-side interCTC variant that provides the layer-8
+# auxiliary CTC supervision needed for key-frame pruning experiments.
+# The actual inference-time frame dropping remains a model-side extension.
+
+name: "KeyFrame-Branchformer-CTC-BPE-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.BranchformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+
+  interctc:
+    loss_weights: [0.3]
+    apply_at_layers: [7]
+
+  optim:
+    weight_decay: 1e-3

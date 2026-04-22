@@ -32,10 +32,12 @@ from nemo.collections.asr.modules.conv_asr import (  # noqa: F401
     ParallelConvASREncoder,
     SpeakerDecoder,
 )
+from nemo.collections.asr.modules.delta_branchformer_encoder import DeltaBranchformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.gated_fc_conformer_encoder import GatedFCConformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.hybrid_autoregressive_transducer import HATJoint  # noqa: F401
 from nemo.collections.asr.modules.lstm_decoder import LSTMDecoder  # noqa: F401
 from nemo.collections.asr.modules.mamba_conformer_encoder import MambaConformerEncoder  # noqa: F401
+from nemo.collections.asr.modules.multiscale_branchformer_encoder import MultiScaleBranchformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.rnn_encoder import RNNEncoder  # noqa: F401
 from nemo.collections.asr.modules.rnnt import (  # noqa: F401
     RNNTDecoder,
@@ -53,4 +55,5 @@ from nemo.collections.asr.modules.ssl_modules import (  # noqa: F401
     RandomProjectionVectorQuantizer,
 )
 from nemo.collections.asr.modules.tempcov_gatedfc_conformer_encoder import TempConvGatedFCConformerEncoder  # noqa: F401
+from nemo.collections.asr.modules.unet_branchformer_encoder import UNetBranchformerEncoder  # noqa: F401
 from nemo.collections.asr.modules.zipformer_encoder import ZipformerEncoder  # noqa: F401

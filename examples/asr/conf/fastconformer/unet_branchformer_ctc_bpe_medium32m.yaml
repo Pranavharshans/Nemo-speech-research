@@ -1,0 +1,31 @@
+# UNet-Branchformer medium CTC model.
+#
+# Uses a 4 / 8 / 4 full-rate -> low-rate -> full-rate schedule while keeping
+# the Branchformer block internals unchanged.
+
+name: "UNet-Branchformer-CTC-BPE-Medium-32M"
+
+defaults:
+  - fast-conformer_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.UNetBranchformerEncoder
+    d_model: 256
+    n_heads: 4
+    n_layers: 16
+    subsampling_conv_channels: 256
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+    unet_stage_layers: [4, 8, 4]
+    unet_downsample_kernel_size: 3
+    unet_upsample_kernel_size: 3
+
+  optim:
+    weight_decay: 1e-3
