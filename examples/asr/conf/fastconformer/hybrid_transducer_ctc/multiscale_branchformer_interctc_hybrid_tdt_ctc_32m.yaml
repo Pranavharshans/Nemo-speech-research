@@ -1,0 +1,20 @@
+# Experimental 32M MultiScale-Branchformer + InterCTC + Hybrid TDT/CTC model.
+#
+# Variant 3 adds a single InterCTC supervision point at encoder block 8
+# (zero-based layer index 7 in config) on top of the Variant 2 architecture.
+# This gives the intended three-loss setup:
+# - 0.49 * TDT
+# - 0.21 * final CTC
+# - 0.30 * layer-8 InterCTC
+# since the hybrid model first combines TDT/CTC using aux_ctc.ctc_loss_weight=0.3
+# and then applies the InterCTC main-loss scaling.
+
+name: "MultiScale-Branchformer-InterCTC-Hybrid-TDT-CTC-32m"
+
+defaults:
+  - multiscale_branchformer_hybrid_tdt_ctc_32m
+
+model:
+  interctc:
+    loss_weights: [0.3]
+    apply_at_layers: [7]
