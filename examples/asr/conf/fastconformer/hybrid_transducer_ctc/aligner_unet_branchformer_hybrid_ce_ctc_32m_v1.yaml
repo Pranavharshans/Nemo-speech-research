@@ -1,0 +1,24 @@
+# Aligner-style UNet-Branchformer hybrid model.
+#
+# Keeps the working UNet Branchformer encoder and auxiliary CTC branch, and
+# replaces the transducer branch with a soft monotonic encoder-side aligner plus
+# a lightweight text-only recurrent scan decoder.
+
+name: "Aligner-UNet-Branchformer-Hybrid-CE-CTC-32m-V1"
+
+defaults:
+  - unet_branchformer_hybrid_tdt_ctc_32m_v2
+
+model:
+  experimental_scan_decoder:
+    enabled: true
+    mode: aligner
+    hidden_size: 320
+    embedding_dim: 256
+    dropout: 0.1
+    label_smoothing: 0.1
+    max_decode_tokens: 192
+    aligner:
+      weight_conv_kernel: 3
+      temperature: 0.35
+      length_loss_weight: 0.25
