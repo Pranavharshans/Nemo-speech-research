@@ -83,6 +83,7 @@ class UNetBranchformerEncoder(BranchformerEncoder):
         unet_stage_layers=None,
         unet_downsample_kernel_size: int = 3,
         unet_upsample_kernel_size: int = 3,
+        capture_stage1_output: bool = False,
     ):
         super().__init__(
             feat_in=feat_in,
@@ -139,6 +140,9 @@ class UNetBranchformerEncoder(BranchformerEncoder):
 
         self.unet_stage_layers = list(unet_stage_layers)
         self.stage_boundaries = (self.unet_stage_layers[0], self.unet_stage_layers[0] + self.unet_stage_layers[1])
+        self.capture_stage1_output = capture_stage1_output
+        self._stage1_output = None
+        self._stage1_length = None
         self.downsample = TemporalDownsampleBlock(
             d_model=d_model,
             kernel_size=unet_downsample_kernel_size,
@@ -193,6 +197,13 @@ class UNetBranchformerEncoder(BranchformerEncoder):
 
         return x, length
 
+    def get_stage1_output(self):
+        return self._stage1_output, self._stage1_length
+
+    def clear_stage1_output(self):
+        self._stage1_output = None
+        self._stage1_length = None
+
     def forward_internal(
         self,
         audio_signal,
@@ -227,6 +238,14 @@ class UNetBranchformerEncoder(BranchformerEncoder):
 
         stage1_end, stage2_end = self.stage_boundaries
         high_res, length = self._run_layer_range(audio_signal, length, 0, stage1_end, cur_att_context_size)
+        if self.capture_stage1_output:
+            stage1_output = high_res
+            if self.out_proj is not None:
+                stage1_output = self.out_proj(stage1_output)
+            self._stage1_output = torch.transpose(stage1_output, 1, 2)
+            self._stage1_length = length.to(dtype=torch.int64)
+        else:
+            self.clear_stage1_output()
         skip = high_res
 
         low_res, low_length = self.downsample(high_res, length)

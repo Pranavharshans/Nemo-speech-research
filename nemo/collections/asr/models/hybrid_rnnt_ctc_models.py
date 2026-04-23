@@ -16,6 +16,7 @@ import copy
 from typing import Any, List, Optional, Union
 
 import torch
+from torch import nn
 from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 
@@ -34,13 +35,58 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging, model_utils
 
 
+class FastSlowTransducerFusion(nn.Module):
+    """Blend shallow full-rate and deep refined encoder views for the transducer branch only."""
+
+    def __init__(self, hidden_size: int, fast_weight_init: float = -1.38629436112):
+        super().__init__()
+        self.fast_projection = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.fast_path_logit = nn.Parameter(torch.tensor(float(fast_weight_init), dtype=torch.float32))
+        nn.init.normal_(self.fast_projection.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.fast_projection.bias)
+
+    def fast_path_weight(self) -> torch.Tensor:
+        return torch.sigmoid(self.fast_path_logit)
+
+    def forward(self, slow_features: torch.Tensor, fast_features: torch.Tensor) -> torch.Tensor:
+        if slow_features.shape != fast_features.shape:
+            raise ValueError(
+                "Fast/slow transducer fusion requires matching tensor shapes. "
+                f"Got slow={tuple(slow_features.shape)} and fast={tuple(fast_features.shape)}."
+            )
+
+        fast_features = fast_features.transpose(1, 2)
+        fast_features = self.fast_projection(fast_features)
+        fast_features = fast_features.transpose(1, 2)
+
+        fast_weight = self.fast_path_weight().to(device=slow_features.device, dtype=slow_features.dtype)
+        return fast_weight * fast_features + (1.0 - fast_weight) * slow_features
+
+
 class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRTranscriptionMixin):
     """Base class for hybrid RNNT/CTC models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
         cfg = model_utils.maybe_update_config_version(cfg)
+        fast_slow_cfg = cfg.get("transducer_fast_slow_fusion", None)
+        if fast_slow_cfg is not None and fast_slow_cfg.get("enabled", False):
+            with open_dict(cfg.encoder):
+                cfg.encoder.capture_stage1_output = True
         super().__init__(cfg=cfg, trainer=trainer)
+
+        self.transducer_fast_slow_fusion = None
+        fast_slow_cfg = self.cfg.get("transducer_fast_slow_fusion", None)
+        if fast_slow_cfg is not None and fast_slow_cfg.get("enabled", False):
+            if not hasattr(self.encoder, "get_stage1_output"):
+                raise ValueError(
+                    "transducer_fast_slow_fusion requires an encoder that exposes stage-1 outputs via "
+                    "`get_stage1_output()`."
+                )
+            self.transducer_fast_slow_fusion = FastSlowTransducerFusion(
+                hidden_size=self.encoder._feat_out,
+                fast_weight_init=fast_slow_cfg.get("fast_weight_init", -1.38629436112),
+            )
 
         if 'aux_ctc' not in self.cfg:
             raise ValueError(
@@ -90,6 +136,26 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
         # setting up interCTC loss (from InterCTCMixin)
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
+
+    def _get_transducer_encoder_output(self, slow_encoded: torch.Tensor, encoded_len: Optional[torch.Tensor] = None):
+        if self.transducer_fast_slow_fusion is None:
+            return slow_encoded
+
+        fast_encoded, fast_len = self.encoder.get_stage1_output()
+        if fast_encoded is None:
+            raise RuntimeError(
+                "transducer_fast_slow_fusion is enabled but no stage-1 encoder features were captured in the "
+                "current forward pass."
+            )
+        if fast_len is not None and encoded_len is not None and not torch.equal(fast_len, encoded_len):
+            raise RuntimeError(
+                "Stage-1 and final encoder lengths diverged during fast-slow fusion: "
+                f"fast={fast_len.tolist()} slow={encoded_len.tolist()}"
+            )
+
+        transducer_encoded = self.transducer_fast_slow_fusion(slow_features=slow_encoded, fast_features=fast_encoded)
+        self.encoder.clear_stage1_output()
+        return transducer_encoded
 
     @torch.no_grad()
     def transcribe(
@@ -190,12 +256,16 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
     def _transcribe_forward(self, batch: Any, trcfg: TranscribeConfig):
         if self.cur_decoder == "rnnt":
-            return super()._transcribe_forward(batch, trcfg)
+            encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
+            encoded = self._get_transducer_encoder_output(encoded, encoded_len=encoded_len)
+            return dict(encoded=encoded, encoded_len=encoded_len)
 
         # CTC Path
         encoded, encoded_len = self.forward(input_signal=batch[0], input_signal_length=batch[1])
 
         logits = self.ctc_decoder(encoder_output=encoded)
+        if hasattr(self.encoder, "clear_stage1_output"):
+            self.encoder.clear_stage1_output()
         output = dict(logits=logits, encoded_len=encoded_len)
 
         del encoded
@@ -388,6 +458,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
+        transducer_encoded = self._get_transducer_encoder_output(encoded, encoded_len=encoded_len)
 
         # During training, loss must be computed, so decoder forward is necessary
         decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
@@ -407,7 +478,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         # If fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
-            joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+            joint = self.joint(encoder_outputs=transducer_encoded, decoder_outputs=decoder)
             loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
             )
@@ -422,7 +493,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
             if compute_wer:
                 self.wer.update(
-                    predictions=encoded,
+                    predictions=transducer_encoded,
                     predictions_lengths=encoded_len,
                     targets=transcript,
                     targets_lengths=transcript_len,
@@ -434,7 +505,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         else:  # If fused Joint-Loss-WER is used
             # Fused joint step
             loss_value, wer, _, _ = self.joint(
-                encoder_outputs=encoded,
+                encoder_outputs=transducer_encoded,
                 decoder_outputs=decoder,
                 encoder_lengths=encoded_len,
                 transcripts=transcript,
@@ -452,6 +523,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
+
+        if self.transducer_fast_slow_fusion is not None:
+            tensorboard_logs['fast_slow_fast_weight'] = self.transducer_fast_slow_fusion.fast_path_weight().detach()
 
         if self.ctc_loss_weight > 0:
             log_probs = self.ctc_decoder(encoder_output=encoded)
@@ -506,11 +580,14 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         del signal
 
         if self.cur_decoder == 'rnnt':
+            transducer_encoded = self._get_transducer_encoder_output(encoded, encoded_len=encoded_len)
             best_hyp = self.decoding.rnnt_decoder_predictions_tensor(
-                encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
+                encoder_output=transducer_encoded, encoded_lengths=encoded_len, return_hypotheses=True
             )
         else:
             logits = self.ctc_decoder(encoder_output=encoded)
+            if hasattr(self.encoder, "clear_stage1_output"):
+                self.encoder.clear_stage1_output()
             best_hyp = self.ctc_decoding.ctc_decoder_predictions_tensor(
                 decoder_outputs=logits,
                 decoder_lengths=encoded_len,
@@ -533,6 +610,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
+        transducer_encoded = self._get_transducer_encoder_output(encoded, encoded_len=encoded_len)
 
         tensorboard_logs = {}
         loss_value = None
@@ -541,7 +619,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
-                joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
+                joint = self.joint(encoder_outputs=transducer_encoded, decoder_outputs=decoder)
 
                 loss_value = self.loss(
                     log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
@@ -549,7 +627,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
                 tensorboard_logs['val_loss'] = loss_value
 
             self.wer.update(
-                predictions=encoded,
+                predictions=transducer_encoded,
                 predictions_lengths=encoded_len,
                 targets=transcript,
                 targets_lengths=transcript_len,
@@ -573,7 +651,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
             # Fused joint step
             loss_value, wer, wer_num, wer_denom = self.joint(
-                encoder_outputs=encoded,
+                encoder_outputs=transducer_encoded,
                 decoder_outputs=decoded,
                 encoder_lengths=encoded_len,
                 transcripts=transcript,

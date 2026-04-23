@@ -1,0 +1,18 @@
+# Explicit fast-slow UNet-Branchformer + Hybrid TDT/CTC model.
+#
+# Builds on the corrected 32M UNet-Branchformer hybrid baseline and exposes the
+# stage-1 full-resolution encoder path directly to the transducer branch via a
+# learned fast-slow fusion module. The auxiliary CTC branch remains attached to
+# the standard final UNet encoder output.
+
+name: "FastSlow-UNet-Branchformer-Hybrid-TDT-CTC-32m-V2"
+
+defaults:
+  - unet_branchformer_hybrid_tdt_ctc_32m_v2
+
+model:
+  transducer_fast_slow_fusion:
+    enabled: true
+    # Sigmoid(-1.386...) ~= 0.2, so the transducer starts by trusting the slow
+    # refined path and gradually learns how much stage-1 context to mix in.
+    fast_weight_init: -1.38629436112
