@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import copy
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
+import editdistance
 import torch
+import torch.nn.functional as F
 from torch import nn
 from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -30,6 +32,7 @@ from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
+from nemo.collections.common.losses import SmoothedCrossEntropyLoss
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging, model_utils
@@ -63,6 +66,227 @@ class FastSlowTransducerFusion(nn.Module):
         return fast_weight * fast_features + (1.0 - fast_weight) * slow_features
 
 
+class TextOnlyScanDecoder(nn.Module):
+    """Lightweight text-only recurrent scanner over token-rate acoustic embeddings."""
+
+    def __init__(
+        self,
+        acoustic_dim: int,
+        vocab_size: int,
+        bos_id: int,
+        eos_id: int,
+        pad_id: int,
+        embedding_dim: int = 256,
+        hidden_size: int = 320,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+        self.pad_id = pad_id
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_id)
+        self.input_projection = nn.Linear(acoustic_dim + embedding_dim, hidden_size)
+        self.rnn_cell = nn.LSTMCell(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.output_projection = nn.Linear(hidden_size, vocab_size)
+
+    def _step(
+        self,
+        acoustic_step: torch.Tensor,
+        prev_tokens: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        embedded = self.embedding(prev_tokens)
+        step_input = torch.cat([acoustic_step, embedded], dim=-1)
+        step_input = torch.tanh(self.input_projection(step_input))
+
+        if state is None:
+            h = acoustic_step.new_zeros(acoustic_step.size(0), self.rnn_cell.hidden_size)
+            c = acoustic_step.new_zeros(acoustic_step.size(0), self.rnn_cell.hidden_size)
+        else:
+            h, c = state
+
+        h, c = self.rnn_cell(step_input, (h, c))
+        logits = self.output_projection(self.dropout(h))
+        return logits, (h, c)
+
+    def forward_teacher_forced(self, acoustic_tokens: torch.Tensor, decoder_inputs: torch.Tensor) -> torch.Tensor:
+        logits = []
+        state = None
+        for step_idx in range(acoustic_tokens.size(1)):
+            step_logits, state = self._step(acoustic_tokens[:, step_idx, :], decoder_inputs[:, step_idx], state)
+            logits.append(step_logits)
+        return torch.log_softmax(torch.stack(logits, dim=1), dim=-1)
+
+    @torch.no_grad()
+    def greedy_decode(
+        self, acoustic_tokens: torch.Tensor, acoustic_token_lengths: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, max_steps, _ = acoustic_tokens.shape
+        max_decode_steps = int(acoustic_token_lengths.max().item()) if acoustic_token_lengths.numel() > 0 else 0
+        max_decode_steps = max(max_decode_steps, 1)
+        predictions = torch.full(
+            (batch_size, max_decode_steps),
+            fill_value=self.pad_id,
+            dtype=torch.long,
+            device=acoustic_tokens.device,
+        )
+        prediction_lengths = acoustic_token_lengths.new_zeros(batch_size)
+
+        prev_tokens = acoustic_tokens.new_full((batch_size,), fill_value=self.bos_id, dtype=torch.long)
+        state = None
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=acoustic_tokens.device)
+
+        for step_idx in range(max_decode_steps):
+            acoustic_step = acoustic_tokens[:, min(step_idx, max_steps - 1), :]
+            step_logits, state = self._step(acoustic_step, prev_tokens, state)
+            next_tokens = step_logits.argmax(dim=-1)
+
+            inactive = step_idx >= acoustic_token_lengths
+            next_tokens = torch.where(inactive | finished, next_tokens.new_full((), self.eos_id), next_tokens)
+
+            predictions[:, step_idx] = next_tokens
+            first_finish = (~finished) & ((next_tokens == self.eos_id) | inactive)
+            prediction_lengths = torch.where(
+                first_finish, prediction_lengths.new_full((), step_idx), prediction_lengths
+            )
+            finished = finished | first_finish
+            prev_tokens = next_tokens
+
+        prediction_lengths = torch.where(
+            prediction_lengths == 0,
+            acoustic_token_lengths.clamp(min=1, max=max_decode_steps),
+            prediction_lengths.clamp(min=1, max=max_decode_steps),
+        )
+        return predictions, prediction_lengths
+
+
+class SoftTokenAlignerBridge(nn.Module):
+    """Soft monotonic token pooling over the final encoder stream."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int = 3,
+        temperature: float = 0.35,
+        length_loss_weight: float = 0.25,
+        max_decode_tokens: int = 192,
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.length_loss_weight = length_loss_weight
+        self.max_decode_tokens = max_decode_tokens
+        self.temporal_conv = nn.Conv1d(hidden_size, hidden_size, kernel_size, padding=kernel_size // 2)
+        self.weight_projection = nn.Linear(hidden_size, 1)
+
+    def forward(
+        self,
+        encoder_outputs: torch.Tensor,
+        encoder_lengths: torch.Tensor,
+        target_token_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, hidden_size, max_time = encoder_outputs.shape
+        features = encoder_outputs.transpose(1, 2)
+        conv_features = self.temporal_conv(encoder_outputs).transpose(1, 2)
+        raw_weights = F.softplus(self.weight_projection(torch.silu(conv_features)).squeeze(-1)) + 1e-4
+
+        time_mask = torch.arange(max_time, device=encoder_outputs.device).unsqueeze(0) < encoder_lengths.unsqueeze(1)
+        raw_weights = raw_weights * time_mask
+        raw_mass = raw_weights.sum(dim=1)
+
+        if target_token_lengths is None:
+            token_lengths = raw_mass.round().clamp(min=1, max=self.max_decode_tokens).long()
+            alignment_loss = raw_mass.new_zeros(())
+        else:
+            token_lengths = target_token_lengths.long().clamp(min=1, max=self.max_decode_tokens)
+            alignment_loss = F.l1_loss(raw_mass, token_lengths.float()) * self.length_loss_weight
+
+        max_tokens = int(token_lengths.max().item())
+        acoustic_tokens = encoder_outputs.new_zeros((batch_size, max_tokens, hidden_size))
+
+        for batch_idx in range(batch_size):
+            frame_count = int(encoder_lengths[batch_idx].item())
+            token_count = int(token_lengths[batch_idx].item())
+            if frame_count <= 0 or token_count <= 0:
+                continue
+
+            frame_features = features[batch_idx, :frame_count]
+            frame_weights = raw_weights[batch_idx, :frame_count]
+            scale = token_count / frame_weights.sum().clamp_min(1e-6)
+            scaled_weights = frame_weights * scale
+            centers = torch.cumsum(scaled_weights, dim=0) - 0.5 * scaled_weights
+            token_centers = torch.arange(token_count, device=encoder_outputs.device, dtype=centers.dtype) + 0.5
+            distance = centers.unsqueeze(1) - token_centers.unsqueeze(0)
+            assignments = torch.exp(-(distance**2) / (2.0 * self.temperature * self.temperature))
+            assignments = assignments * scaled_weights.unsqueeze(1)
+            assignments = assignments / assignments.sum(dim=0, keepdim=True).clamp_min(1e-6)
+            acoustic_tokens[batch_idx, :token_count] = assignments.transpose(0, 1) @ frame_features
+
+        return acoustic_tokens, token_lengths, alignment_loss
+
+
+class CIFTokenBridge(nn.Module):
+    """Differentiable CIF-style token firing on a monotonic cumulative weight path."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int = 3,
+        quantity_loss_weight: float = 1.0,
+        max_decode_tokens: int = 192,
+    ):
+        super().__init__()
+        self.quantity_loss_weight = quantity_loss_weight
+        self.max_decode_tokens = max_decode_tokens
+        self.temporal_conv = nn.Conv1d(hidden_size, hidden_size, kernel_size, padding=kernel_size // 2)
+        self.weight_projection = nn.Linear(hidden_size, 1)
+
+    def forward(
+        self,
+        encoder_outputs: torch.Tensor,
+        encoder_lengths: torch.Tensor,
+        target_token_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, hidden_size, max_time = encoder_outputs.shape
+        features = encoder_outputs.transpose(1, 2)
+        conv_features = self.temporal_conv(encoder_outputs).transpose(1, 2)
+        alpha = torch.sigmoid(self.weight_projection(torch.silu(conv_features)).squeeze(-1))
+
+        time_mask = torch.arange(max_time, device=encoder_outputs.device).unsqueeze(0) < encoder_lengths.unsqueeze(1)
+        alpha = alpha * time_mask
+        raw_mass = alpha.sum(dim=1)
+
+        if target_token_lengths is None:
+            token_lengths = raw_mass.round().clamp(min=1, max=self.max_decode_tokens).long()
+            quantity_loss = raw_mass.new_zeros(())
+        else:
+            token_lengths = target_token_lengths.long().clamp(min=1, max=self.max_decode_tokens)
+            quantity_loss = F.l1_loss(raw_mass, token_lengths.float()) * self.quantity_loss_weight
+
+        max_tokens = int(token_lengths.max().item())
+        acoustic_tokens = encoder_outputs.new_zeros((batch_size, max_tokens, hidden_size))
+
+        for batch_idx in range(batch_size):
+            frame_count = int(encoder_lengths[batch_idx].item())
+            token_count = int(token_lengths[batch_idx].item())
+            if frame_count <= 0 or token_count <= 0:
+                continue
+
+            frame_features = features[batch_idx, :frame_count]
+            frame_alpha = alpha[batch_idx, :frame_count]
+            scale = token_count / frame_alpha.sum().clamp_min(1e-6)
+            scaled_alpha = frame_alpha * scale
+            centers = torch.cumsum(scaled_alpha, dim=0) - 0.5 * scaled_alpha
+            token_centers = torch.arange(token_count, device=encoder_outputs.device, dtype=centers.dtype) + 0.5
+            distance = torch.abs(centers.unsqueeze(1) - token_centers.unsqueeze(0))
+            assignments = F.relu(1.0 - distance)
+            assignments = assignments * scaled_alpha.unsqueeze(1)
+            assignments = assignments / assignments.sum(dim=0, keepdim=True).clamp_min(1e-6)
+            acoustic_tokens[batch_idx, :token_count] = assignments.transpose(0, 1) @ frame_features
+
+        return acoustic_tokens, token_lengths, quantity_loss
+
+
 class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRTranscriptionMixin):
     """Base class for hybrid RNNT/CTC models."""
 
@@ -70,7 +294,16 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
         cfg = model_utils.maybe_update_config_version(cfg)
         fast_slow_cfg = cfg.get("transducer_fast_slow_fusion", None)
+        scan_cfg = cfg.get("experimental_scan_decoder", None)
         if fast_slow_cfg is not None and fast_slow_cfg.get("enabled", False):
+            with open_dict(cfg.encoder):
+                cfg.encoder.capture_stage1_output = True
+        if (
+            scan_cfg is not None
+            and scan_cfg.get("enabled", False)
+            and scan_cfg.get("mode", "").lower() == "cif"
+            and scan_cfg.get("cif", {}).get("input_source", "stage1") == "stage1"
+        ):
             with open_dict(cfg.encoder):
                 cfg.encoder.capture_stage1_output = True
         super().__init__(cfg=cfg, trainer=trainer)
@@ -134,6 +367,53 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         # setting the RNNT decoder as the default one
         self.cur_decoder = "rnnt"
 
+        self.experimental_scan_cfg = self.cfg.get("experimental_scan_decoder", None)
+        self.experimental_scan_decoder = None
+        self.experimental_scan_bridge = None
+        self.experimental_scan_loss = None
+        if self.experimental_scan_cfg is not None and self.experimental_scan_cfg.get("enabled", False):
+            if not hasattr(self, "tokenizer"):
+                raise ValueError("experimental_scan_decoder requires a tokenizer-enabled hybrid model.")
+
+            vocab_size = len(self.joint.vocabulary)
+            self.experimental_scan_decoder = TextOnlyScanDecoder(
+                acoustic_dim=self.encoder._feat_out,
+                vocab_size=vocab_size,
+                bos_id=self.tokenizer.bos_id,
+                eos_id=self.tokenizer.eos_id,
+                pad_id=self.tokenizer.pad_id,
+                embedding_dim=self.experimental_scan_cfg.get("embedding_dim", self.encoder._feat_out),
+                hidden_size=self.experimental_scan_cfg.get("hidden_size", 320),
+                dropout=self.experimental_scan_cfg.get("dropout", 0.1),
+            )
+            self.experimental_scan_loss = SmoothedCrossEntropyLoss(
+                pad_id=self.tokenizer.pad_id,
+                label_smoothing=self.experimental_scan_cfg.get("label_smoothing", 0.0),
+            )
+
+            mode = self.experimental_scan_cfg.get("mode", "").lower()
+            if mode == "aligner":
+                aligner_cfg = self.experimental_scan_cfg.get("aligner", {})
+                self.experimental_scan_bridge = SoftTokenAlignerBridge(
+                    hidden_size=self.encoder._feat_out,
+                    kernel_size=aligner_cfg.get("weight_conv_kernel", 3),
+                    temperature=aligner_cfg.get("temperature", 0.35),
+                    length_loss_weight=aligner_cfg.get("length_loss_weight", 0.25),
+                    max_decode_tokens=self.experimental_scan_cfg.get("max_decode_tokens", 192),
+                )
+            elif mode == "cif":
+                cif_cfg = self.experimental_scan_cfg.get("cif", {})
+                self.experimental_scan_bridge = CIFTokenBridge(
+                    hidden_size=self.encoder._feat_out,
+                    kernel_size=cif_cfg.get("weight_conv_kernel", 3),
+                    quantity_loss_weight=cif_cfg.get("quantity_loss_weight", 1.0),
+                    max_decode_tokens=self.experimental_scan_cfg.get("max_decode_tokens", 192),
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported experimental_scan_decoder mode: {self.experimental_scan_cfg.get('mode')}"
+                )
+
         # setting up interCTC loss (from InterCTCMixin)
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
 
@@ -156,6 +436,132 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         transducer_encoded = self.transducer_fast_slow_fusion(slow_features=slow_encoded, fast_features=fast_encoded)
         self.encoder.clear_stage1_output()
         return transducer_encoded
+
+    def _experimental_scan_enabled(self) -> bool:
+        return self.experimental_scan_decoder is not None and self.experimental_scan_bridge is not None
+
+    def _uses_stage1_scan_input(self) -> bool:
+        if not self._experimental_scan_enabled():
+            return False
+        return (
+            self.experimental_scan_cfg.get("mode", "").lower() == "cif"
+            and self.experimental_scan_cfg.get("cif", {}).get("input_source", "stage1") == "stage1"
+        )
+
+    def _build_scan_decoder_targets(
+        self, transcript: torch.Tensor, transcript_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = transcript.size(0)
+        device = transcript.device
+        target_lengths = transcript_len + 1
+        max_target_length = int(target_lengths.max().item())
+
+        decoder_targets = torch.full(
+            (batch_size, max_target_length),
+            fill_value=self.tokenizer.pad_id,
+            dtype=transcript.dtype,
+            device=device,
+        )
+        decoder_inputs = torch.full_like(decoder_targets, fill_value=self.tokenizer.pad_id)
+
+        for batch_idx in range(batch_size):
+            cur_len = int(transcript_len[batch_idx].item())
+            if cur_len > 0:
+                decoder_targets[batch_idx, :cur_len] = transcript[batch_idx, :cur_len]
+                decoder_inputs[batch_idx, 1 : cur_len + 1] = transcript[batch_idx, :cur_len]
+            decoder_targets[batch_idx, cur_len] = self.tokenizer.eos_id
+            decoder_inputs[batch_idx, 0] = self.tokenizer.bos_id
+
+        return decoder_inputs, decoder_targets, target_lengths
+
+    def _get_scan_bridge_inputs(
+        self, encoded: torch.Tensor, encoded_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self._uses_stage1_scan_input():
+            return encoded, encoded_len
+
+        if not hasattr(self.encoder, "get_stage1_output"):
+            raise RuntimeError("CIF experimental scan decoder requires stage-1 encoder output support.")
+
+        stage1_encoded, stage1_len = self.encoder.get_stage1_output()
+        if stage1_encoded is None:
+            raise RuntimeError("CIF experimental scan decoder expected captured stage-1 outputs but found none.")
+        self.encoder.clear_stage1_output()
+        return stage1_encoded, stage1_len if stage1_len is not None else encoded_len
+
+    def _strip_special_tokens(self, token_ids: List[int]) -> List[int]:
+        cleaned = []
+        for token_id in token_ids:
+            if token_id == self.tokenizer.eos_id:
+                break
+            if token_id in (self.tokenizer.pad_id, self.tokenizer.bos_id):
+                continue
+            cleaned.append(token_id)
+        return cleaned
+
+    def _compute_text_error_counts(
+        self, predicted_tokens: torch.Tensor, predicted_lengths: torch.Tensor, transcript: torch.Tensor, transcript_len: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scores = 0
+        words = 0
+
+        for prediction, pred_len, target, target_len in zip(
+            predicted_tokens.detach().cpu().tolist(),
+            predicted_lengths.detach().cpu().tolist(),
+            transcript.detach().cpu().tolist(),
+            transcript_len.detach().cpu().tolist(),
+        ):
+            prediction = self._strip_special_tokens(prediction[:pred_len])
+            target = target[:target_len]
+
+            hypothesis = self.tokenizer.ids_to_text(prediction).strip()
+            reference = self.tokenizer.ids_to_text(target).strip()
+
+            ref_words = reference.split()
+            hyp_words = hypothesis.split()
+            words += len(ref_words)
+            scores += editdistance.eval(hyp_words, ref_words)
+
+        return (
+            transcript_len.new_tensor(float(scores), dtype=torch.float32),
+            transcript_len.new_tensor(float(words), dtype=torch.float32),
+        )
+
+    def _run_experimental_scan_decoder(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        compute_loss: bool = True,
+        compute_predictions: bool = False,
+    ):
+        decoder_inputs, decoder_targets, target_lengths = self._build_scan_decoder_targets(transcript, transcript_len)
+        bridge_inputs, bridge_lengths = self._get_scan_bridge_inputs(encoded, encoded_len)
+        acoustic_tokens, acoustic_token_lengths, bridge_aux_loss = self.experimental_scan_bridge(
+            bridge_inputs,
+            bridge_lengths,
+            target_token_lengths=target_lengths if compute_loss else None,
+        )
+
+        scan_loss = None
+        if compute_loss:
+            log_probs = self.experimental_scan_decoder.forward_teacher_forced(acoustic_tokens, decoder_inputs)
+            scan_loss = self.experimental_scan_loss(log_probs=log_probs, labels=decoder_targets) + bridge_aux_loss
+
+        predicted_tokens, predicted_lengths = None, None
+        if compute_predictions:
+            predicted_tokens, predicted_lengths = self.experimental_scan_decoder.greedy_decode(
+                acoustic_tokens, acoustic_token_lengths
+            )
+
+        return {
+            "scan_loss": scan_loss,
+            "bridge_aux_loss": bridge_aux_loss,
+            "predicted_tokens": predicted_tokens,
+            "predicted_lengths": predicted_lengths,
+            "token_lengths": acoustic_token_lengths,
+        }
 
     @torch.no_grad()
     def transcribe(
@@ -441,8 +847,199 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
         return None
 
+    def _training_step_experimental_scan(self, batch, batch_nb):
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        if self.is_interctc_enabled():
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
+
+        signal, signal_len, transcript, transcript_len = batch
+
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+            sample_id = self._trainer.global_step
+        else:
+            log_every_n_steps = 1
+            sample_id = batch_nb
+        compute_wer = (sample_id + 1) % log_every_n_steps == 0
+
+        scan_outputs = self._run_experimental_scan_decoder(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            transcript=transcript,
+            transcript_len=transcript_len,
+            compute_loss=True,
+            compute_predictions=compute_wer,
+        )
+        branch_loss = self.add_auxiliary_losses(scan_outputs["scan_loss"])
+
+        tensorboard_logs = {
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            'train_scan_loss': branch_loss,
+            'train_alignment_aux_loss': scan_outputs["bridge_aux_loss"],
+        }
+
+        if compute_wer:
+            wer_num, wer_denom = self._compute_text_error_counts(
+                scan_outputs["predicted_tokens"],
+                scan_outputs["predicted_lengths"],
+                transcript,
+                transcript_len,
+            )
+            tensorboard_logs['training_batch_wer'] = wer_num / wer_denom.clamp_min(1.0)
+
+        if self.ctc_loss_weight > 0:
+            log_probs = self.ctc_decoder(encoder_output=encoded)
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            tensorboard_logs['train_ctc_loss'] = ctc_loss
+            loss_value = (1 - self.ctc_loss_weight) * branch_loss + self.ctc_loss_weight * ctc_loss
+            if compute_wer:
+                self.ctc_wer.update(
+                    predictions=log_probs,
+                    targets=transcript,
+                    targets_lengths=transcript_len,
+                    predictions_lengths=encoded_len,
+                )
+                ctc_wer, _, _ = self.ctc_wer.compute()
+                self.ctc_wer.reset()
+                tensorboard_logs['training_batch_wer_ctc'] = ctc_wer
+        else:
+            loss_value = branch_loss
+
+        loss_value, additional_logs = self.add_interctc_losses(
+            loss_value, transcript, transcript_len, compute_wer=compute_wer
+        )
+        tensorboard_logs.update(additional_logs)
+        tensorboard_logs['train_loss'] = loss_value
+
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        self.log_dict(tensorboard_logs)
+        return {'loss': loss_value}
+
+    def _validation_pass_experimental_scan(self, batch, batch_idx, dataloader_idx):
+        if self.is_interctc_enabled():
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
+
+        signal, signal_len, transcript, transcript_len = batch
+
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
+        scan_outputs = self._run_experimental_scan_decoder(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            transcript=transcript,
+            transcript_len=transcript_len,
+            compute_loss=self.compute_eval_loss,
+            compute_predictions=True,
+        )
+        tensorboard_logs = {}
+        loss_value = scan_outputs["scan_loss"]
+        if loss_value is not None:
+            tensorboard_logs['val_scan_loss'] = loss_value
+
+        wer_num, wer_denom = self._compute_text_error_counts(
+            scan_outputs["predicted_tokens"],
+            scan_outputs["predicted_lengths"],
+            transcript,
+            transcript_len,
+        )
+        tensorboard_logs['val_wer_num'] = wer_num
+        tensorboard_logs['val_wer_denom'] = wer_denom
+        tensorboard_logs['val_wer'] = wer_num / wer_denom.clamp_min(1.0)
+
+        log_probs = self.ctc_decoder(encoder_output=encoded)
+        if self.compute_eval_loss:
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            tensorboard_logs['val_ctc_loss'] = ctc_loss
+            tensorboard_logs['val_scan_aux_loss'] = scan_outputs["bridge_aux_loss"]
+            loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
+            tensorboard_logs['val_loss'] = loss_value
+
+        self.ctc_wer.update(
+            predictions=log_probs,
+            targets=transcript,
+            targets_lengths=transcript_len,
+            predictions_lengths=encoded_len,
+        )
+        ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
+        self.ctc_wer.reset()
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
+        tensorboard_logs['val_wer_ctc'] = ctc_wer
+
+        self.log('global_step', torch.tensor(self.trainer.global_step, dtype=torch.float32))
+
+        loss_value, additional_logs = self.add_interctc_losses(
+            loss_value,
+            transcript,
+            transcript_len,
+            compute_wer=True,
+            compute_loss=self.compute_eval_loss,
+            log_wer_num_denom=True,
+            log_prefix="val_",
+        )
+        if self.compute_eval_loss:
+            tensorboard_logs['val_loss'] = loss_value
+        tensorboard_logs.update(additional_logs)
+
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
+        return tensorboard_logs
+
+    def _predict_step_experimental_scan(self, batch, batch_idx, dataloader_idx=0):
+        signal, signal_len, transcript, transcript_len, sample_id = batch
+
+        if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+        else:
+            encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+        del signal
+
+        scan_outputs = self._run_experimental_scan_decoder(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            transcript=transcript,
+            transcript_len=transcript_len,
+            compute_loss=False,
+            compute_predictions=True,
+        )
+
+        hypotheses = []
+        for prediction, pred_len in zip(
+            scan_outputs["predicted_tokens"].detach().cpu().tolist(),
+            scan_outputs["predicted_lengths"].detach().cpu().tolist(),
+        ):
+            token_ids = self._strip_special_tokens(prediction[:pred_len])
+            hypotheses.append(self.tokenizer.ids_to_text(token_ids))
+
+        if isinstance(sample_id, torch.Tensor):
+            sample_id = sample_id.cpu().detach().numpy()
+        return list(zip(sample_id, hypotheses))
+
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
+        if self._experimental_scan_enabled():
+            return self._training_step_experimental_scan(batch, batch_nb)
+
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
@@ -570,6 +1167,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        if self._experimental_scan_enabled():
+            return self._predict_step_experimental_scan(batch, batch_idx, dataloader_idx=dataloader_idx)
+
         signal, signal_len, transcript, transcript_len, sample_id = batch
 
         # forward() only performs encoder forward
@@ -599,6 +1199,9 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         return list(zip(sample_id, best_hyp))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx):
+        if self._experimental_scan_enabled():
+            return self._validation_pass_experimental_scan(batch, batch_idx, dataloader_idx)
+
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
