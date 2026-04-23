@@ -1,0 +1,33 @@
+# Corrected 32M UNet-Branchformer + Hybrid TDT/CTC model with deeper late
+# full-resolution refinement.
+#
+# Compared to the working 4/8/4 UNet hybrid TDT/CTC v2 model, this redistributes
+# the 16 encoder layers to a 4/6/6 schedule so that the output-side refinement
+# path gets more capacity after the bottleneck.
+
+name: "UNet-Branchformer-Hybrid-TDT-CTC-32m-V2-Stage466"
+
+defaults:
+  - fc_hybrid_tdt_ctc_32m_v2
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.UNetBranchformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 16
+    d_model: 256
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 4
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+    unet_stage_layers: [4, 6, 6]
+    unet_downsample_kernel_size: 3
+    unet_upsample_kernel_size: 3
