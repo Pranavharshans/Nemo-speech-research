@@ -1,0 +1,46 @@
+# Corrected 32M UNet-Branchformer + Hybrid RNNT/CTC model.
+#
+# This ports the working medium-size hybrid transducer/CTC recipe to the UNet
+# Branchformer encoder family in order to isolate whether the late-stage limit
+# in the current UNet hybrid runs is specific to TDT or to hybrid transducer
+# training more broadly.
+
+name: "UNet-Branchformer-Hybrid-RNNT-CTC-32m-V2"
+
+defaults:
+  - fastconformer_hybrid_transducer_ctc_bpe
+
+model:
+  preprocessor:
+    features: 80
+    log: true
+    pad_value: 0.0
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+
+  train_ds:
+    max_duration: 20
+
+  encoder:
+    _target_: nemo.collections.asr.modules.UNetBranchformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 16
+    d_model: 256
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 4
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 4
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+    unet_stage_layers: [4, 8, 4]
+    unet_downsample_kernel_size: 3
+    unet_upsample_kernel_size: 3

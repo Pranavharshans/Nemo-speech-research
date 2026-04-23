@@ -1,0 +1,16 @@
+# Experimental 32M UNet-Branchformer + InterCTC + Hybrid TDT/CTC model.
+#
+# Adds a single InterCTC supervision point at encoder block 8 (zero-based
+# layer index 7 in config) on top of the working UNet hybrid TDT/CTC v2 model.
+# This is intended to improve the later refinement phase after the very strong
+# early convergence already observed with the baseline UNet hybrid recipe.
+
+name: "UNet-Branchformer-InterCTC-Hybrid-TDT-CTC-32m-V2"
+
+defaults:
+  - unet_branchformer_hybrid_tdt_ctc_32m_v2
+
+model:
+  interctc:
+    loss_weights: [0.3]
+    apply_at_layers: [7]

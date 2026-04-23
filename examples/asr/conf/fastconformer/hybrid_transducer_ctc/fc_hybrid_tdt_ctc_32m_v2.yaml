@@ -1,0 +1,44 @@
+# Corrected 32M FastConformer + Hybrid TDT/CTC model.
+#
+# This is a direct dimensional port of the large FastConformer TDT/CTC recipe
+# onto the official medium (32M) FastConformer shape documented in
+# fast-conformer_transducer_bpe.yaml:
+# - 16 encoder layers
+# - d_model 256
+# - 4 attention heads
+# - conv kernel size 9
+# - predictor / joint hidden size kept at 640
+#
+# Unlike the earlier experimental 32M hybrid config, this keeps the large-model
+# TDT decoder/joint recipe intact and only changes the encoder/front-end scale.
+
+name: "FC-Hybrid-TDT-CTC-32m-V2"
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+
+model:
+  preprocessor:
+    features: 80
+    log: true
+    pad_value: 0.0
+
+  model_defaults:
+    enc_hidden: ${model.encoder.d_model}
+    pred_hidden: 640
+    joint_hidden: 640
+
+  train_ds:
+    max_duration: 20
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 16
+    d_model: 256
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 4
+    xscaling: true
+    conv_kernel_size: 9
