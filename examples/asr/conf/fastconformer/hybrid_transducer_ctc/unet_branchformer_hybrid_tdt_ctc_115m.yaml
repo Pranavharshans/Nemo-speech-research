@@ -1,0 +1,45 @@
+# Large (~115M) UNet-Branchformer + Hybrid TDT/CTC model.
+#
+# This inherits the validated large FastConformer hybrid TDT/CTC recipe and
+# swaps only the encoder to the UNet-Branchformer family while preserving the
+# same large-model training envelope:
+# - 17 encoder layers
+# - d_model 512
+# - 8 attention heads
+# - predictor / joint hidden size 640
+#
+# The U-Net stage schedule uses 4 / 9 / 4 layers so the large model stays
+# close to the symmetric 4 / 8 / 4 medium design while assigning the extra
+# layer to the bottleneck stage.
+#
+# To stay close to the original ~115M FastConformer parameter budget, the
+# Branchformer cgMLP expansion is reduced to 3x instead of the 4x value used by
+# the medium 32M Branchformer-family experiments.
+
+name: "UNet-Branchformer-Hybrid-TDT-CTC-115m"
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+
+model:
+  encoder:
+    _target_: nemo.collections.asr.modules.UNetBranchformerEncoder
+    feat_in: ${model.preprocessor.features}
+    n_layers: 17
+    d_model: 512
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    ff_expansion_factor: 4
+    n_heads: 8
+    xscaling: true
+    cgmlp_conv_kernel: 31
+    cgmlp_expansion_factor: 3
+    merge_conv_kernel: 3
+    use_linear_after_conv: false
+    gate_activation: identity
+    use_ffn: true
+    macaron_ffn: false
+    unet_stage_layers: [4, 9, 4]
+    unet_downsample_kernel_size: 3
+    unet_upsample_kernel_size: 3
